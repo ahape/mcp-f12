@@ -6,7 +6,19 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FindDef</AssemblyName>
-  </PropertyGroup>
+    <!-- 1. Enable Tool Packing -->
+    <PackAsTool>true</PackAsTool>
+    <!-- 2. The command users will type in their terminal (e.g., 'finddef') -->
+    <ToolCommandName>f12</ToolCommandName>
+    <!-- 3. The unique ID for NuGet (must be unique on nuget.org) -->
+    <PackageId>Brightmetrics.Mcp.F12</PackageId>
+    <!-- 4. Versioning and Metadata -->
+    <Version>1.0.0</Version>
+    <Authors>Alan Hape</Authors>
+    <Description>CLI tool to resolve C# definitions via Roslyn.</Description>
+    <!-- Optional: Output folder for the package -->
+    <PackageOutputPath>./nupkg</PackageOutputPath>
+   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Build.Locator" Version="1.6.10" />
