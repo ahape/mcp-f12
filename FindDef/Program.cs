@@ -40,11 +40,16 @@ workspace.LoadMetadataForReferencedProjects = true;
 var workspaceErrors = new System.Collections.Generic.List<string>();
 workspace.WorkspaceFailed += (_, e) => workspaceErrors.Add(e.Diagnostic.Message);
 
+var verboseMode = args.Contains("--verbose");
+var timing = System.Diagnostics.Stopwatch.StartNew();
 try
 {
-    var solution = await workspace.OpenSolutionAsync(slnPath);
 
-    if (workspaceErrors.Count > 0 && args.Contains("--verbose"))
+    if (verboseMode) Console.WriteLine("VERBOSE: Opening solution {0}", slnPath);
+    var solution = await workspace.OpenSolutionAsync(slnPath);
+    if (verboseMode) Console.WriteLine("VERBOSE: Done ({0})", timing.Elapsed);
+
+    if (workspaceErrors.Count > 0 && verboseMode)
     {
         Console.Error.WriteLine($"[Workspace warnings: {workspaceErrors.Count}]");
         foreach (var err in workspaceErrors.Take(10))
@@ -58,6 +63,7 @@ try
             Console.WriteLine("Error: -pos mode requires <FilePath> <Line> <Column>");
             return 1;
         }
+        if (verboseMode) Console.WriteLine("VERBOSE: Opening solution {0}", slnPath);
         await ResolveByLocation(solution, args[2], int.Parse(args[3]), int.Parse(args[4]));
     }
     else if (mode == "-name")
@@ -141,10 +147,12 @@ async Task ResolveByLocation(Solution solution, string filePath, int line, int c
 
 async Task ResolveByName(Solution solution, string symbolName)
 {
+    if (verboseMode) Console.WriteLine("VERBOSE: Running SymbolFinder.FindSourceDeclarationsAsync '{0}'", symbolName);
     // Search entire solution for declarations matching the name
     var symbols = await SymbolFinder.FindSourceDeclarationsAsync(solution, symbolName, ignoreCase: false);
-    var results = symbols.ToList();
+    if (verboseMode) Console.WriteLine("VERBOSE: Done ({0})", timing.Elapsed);
 
+    var results = symbols.ToList();
     if (!results.Any())
     {
         Console.WriteLine("No symbols found with that name.");
