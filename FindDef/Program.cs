@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Diagnostics;
+using System.IO;
+using System.Text.Json;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -10,139 +12,137 @@ using Microsoft.CodeAnalysis.FindSymbols;
 
 #region Main
 
-// 1. Register MSBuild
+// 1. Register MSBuild (Once per process)
 if (!MSBuildLocator.IsRegistered)
 {
     var instances = MSBuildLocator.QueryVisualStudioInstances().ToArray();
     if (instances.Length == 0)
     {
-        Console.WriteLine("Error: No .NET SDK or Visual Studio instance found. Please install the .NET SDK.");
+        Console.Error.WriteLine("Error: No .NET SDK or Visual Studio instance found.");
         return 1;
     }
     MSBuildLocator.RegisterInstance(instances.OrderByDescending(x => x.Version).First());
 }
 
-// 2. Parse Arguments (Separate flags from positional args)
-var argList = args.ToList();
-bool verbose = argList.Remove("--verbose");
-
-if (argList.Count < 3 || argList[1] != "-name")
-{
-    Console.WriteLine("FindDef <SolutionPath> -name <SymbolName> [--verbose]");
-    Console.WriteLine("Example: FindDef Web -name MyController --verbose");
-    return 1;
-}
-
-string inputPath = argList[0];
-string symbol = argList[2];
-
-// 3. Resolve Solution Path (Dictionary Lookup)
+// 2. Define Shortcuts
 var solutionShortcuts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 {
     ["Web"] = Environment.GetEnvironmentVariable("WEB_SLN_PATH")
               ?? @"C:\src\projects\BrightMetricsWeb\BrightMetricsWeb.sln"
 };
 
-string slnPath = solutionShortcuts.ContainsKey(inputPath)
-    ? solutionShortcuts[inputPath]
-    : inputPath;
+// 3. State Management
+MSBuildWorkspace? currentWorkspace = null;
+Solution? currentSolution = null;
+string? loadedSlnPath = null;
 
-// 4. Setup Logging
-if (verbose)
+Console.Error.WriteLine("Ready. Enter: <SolutionPathOrKey> <SymbolName>");
+Console.Error.WriteLine("Example: Web MyController");
+
+// 4. Input Loop
+while (true)
 {
-    var tracer = new VerboseListener();
-    Trace.Listeners.Add(tracer);
-    Trace.AutoFlush = true;
-}
+    Console.Error.Write("> "); // Prompt on Stderr so it doesn't pollute Stdout pipe
+    string? input = Console.ReadLine();
 
-// 5. Open Workspace
-using var workspace = MSBuildWorkspace.Create();
-workspace.LoadMetadataForReferencedProjects = true;
+    if (string.IsNullOrWhiteSpace(input)) break;
+    if (input.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
 
-var workspaceErrors = new List<string>();
-workspace.WorkspaceFailed += (_, e) => workspaceErrors.Add(e.Diagnostic.Message);
-
-try
-{
-    Trace.TraceInformation("Opening solution {0}", slnPath);
-
-    // Validate file existence before letting Roslyn throw a generic error
-    if (!System.IO.File.Exists(slnPath))
+    var parts = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length < 2)
     {
-        Console.WriteLine($"Error: Solution file not found at '{slnPath}'");
-        return 1;
+        Console.Error.WriteLine("Invalid input. Expected: <Solution> <Symbol>");
+        continue;
     }
 
-    var solution = await workspace.OpenSolutionAsync(slnPath);
-    Trace.TraceInformation("Finished loading solution");
+    string slnKey = parts[0];
+    string symbolName = parts[1];
 
-    if (workspaceErrors.Count > 0)
+    // Resolve Path
+    string targetSlnPath = solutionShortcuts.ContainsKey(slnKey)
+        ? solutionShortcuts[slnKey]
+        : slnKey;
+
+    if (!File.Exists(targetSlnPath))
     {
-        Trace.TraceWarning($"[Workspace warnings: {workspaceErrors.Count}]");
-        foreach (var err in workspaceErrors.Take(10))
-            Trace.TraceWarning($"  {err}");
+        WriteJsonError($"Solution file not found: {targetSlnPath}");
+        continue;
     }
 
-    await ResolveByName(solution, symbol);
-}
-catch (Exception ex)
-{
-    Console.WriteLine($"Error: {ex.Message}");
-    if (verbose) Console.WriteLine(ex.StackTrace);
-    return 1;
+    try
+    {
+        // 5. Load Solution (Only if changed)
+        if (currentSolution == null || !string.Equals(loadedSlnPath, targetSlnPath, StringComparison.OrdinalIgnoreCase))
+        {
+            // Dispose previous workspace if exists
+            currentWorkspace?.Dispose();
+
+            Console.Error.WriteLine($"Loading solution: {targetSlnPath}...");
+
+            // Create new
+            currentWorkspace = MSBuildWorkspace.Create();
+            currentWorkspace.LoadMetadataForReferencedProjects = true;
+
+            // Capture failures silently to stderr
+            currentWorkspace.WorkspaceFailed += (_, e) => Console.Error.WriteLine($"[MSBuild Warning] {e.Diagnostic.Message}");
+
+            currentSolution = await currentWorkspace.OpenSolutionAsync(targetSlnPath);
+            loadedSlnPath = targetSlnPath;
+            Console.Error.WriteLine("Solution loaded.");
+        }
+
+        // 6. Find and Output
+        await FindAndPrintJson(currentSolution!, symbolName);
+    }
+    catch (Exception ex)
+    {
+        WriteJsonError(ex.Message);
+        // Reset state on critical failure
+        currentWorkspace?.Dispose();
+        currentWorkspace = null;
+        currentSolution = null;
+        loadedSlnPath = null;
+    }
 }
 
 return 0;
 
 #endregion
 
-async Task ResolveByName(Solution solution, string symbolName)
+async Task FindAndPrintJson(Solution solution, string symbolName)
 {
-    Trace.TraceInformation("Running SymbolFinder.FindSourceDeclarationsAsync '{0}'", symbolName);
     var symbols = await SymbolFinder.FindSourceDeclarationsAsync(solution, symbolName, ignoreCase: false);
-    var results = symbols.ToList();
 
-    if (!results.Any())
-    {
-        Console.WriteLine("No symbols found with that name.");
-        return;
-    }
-
-    Console.WriteLine($"Found {results.Count} matching definitions:");
-    foreach (var sym in results)
-    {
-        // Safety: Ensure there is a location and it is in source code
-        var loc = sym.Locations.FirstOrDefault(l => l.IsInSource);
-        if (loc == null)
+    var results = symbols
+        .SelectMany(sym => sym.Locations)
+        .Where(loc => loc.IsInSource)
+        .Select(loc =>
         {
-            Trace.TraceWarning($"Skipping symbol '{sym.Name}': No source location found.");
-            continue;
-        }
+            var span = loc.GetLineSpan();
+            var sym = symbols.First(s => s.Locations.Contains(loc));
 
-        var span = loc.GetLineSpan();
+            return new
+            {
+                symbol = sym.Name,
+                container = sym.ContainingType?.Name ?? "global",
+                kind = sym.Kind.ToString(),
+                file = span.Path,
+                // Roslyn is 0-based, Editors are 1-based
+                line = span.StartLinePosition.Line + 1,
+                character = span.StartLinePosition.Character + 1
+            };
+        })
+        .ToList();
 
-        string container = sym.ContainingType != null ? sym.ContainingType.Name : "global::";
-        string accessibility = sym.DeclaredAccessibility.ToString();
-
-        Console.WriteLine("---");
-        Console.WriteLine($"Context: {container}.{sym.Name} ({accessibility})");
-        Console.WriteLine($"File:    {span.Path}");
-        // Add 1 to line number for human-readable (editors are 1-based, Roslyn is 0-based)
-        Console.WriteLine($"Line:    {span.StartLinePosition.Line + 1}");
-    }
+    // Output raw JSON to StdOut
+    string json = JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = false });
+    Console.WriteLine(json);
+    Console.Out.Flush();
 }
 
-public class VerboseListener : ConsoleTraceListener
+void WriteJsonError(string message)
 {
-    public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? message)
-    {
-        if (!string.IsNullOrEmpty(message))
-            WriteLine($"[{eventType}] {message}");
-    }
-
-    public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? format, params object?[]? args)
-    {
-        if (format != null)
-            WriteLine($"[{eventType}] {string.Format(format, args ?? Array.Empty<object>())}");
-    }
+    var errObj = new { error = message };
+    Console.WriteLine(JsonSerializer.Serialize(errObj));
+    Console.Out.Flush();
 }
