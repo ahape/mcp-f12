@@ -32,13 +32,10 @@ workspace.LoadMetadataForReferencedProjects = true;
 // Collect workspace load failures for diagnostics
 var workspaceErrors = new System.Collections.Generic.List<string>();
 workspace.WorkspaceFailed += (_, e) => workspaceErrors.Add(e.Diagnostic.Message);
-
-var verboseMode = args.Contains("--verbose");
-var timing = System.Diagnostics.Stopwatch.StartNew();
-
-if (verboseMode)
+if (args.Contains("--verbose"))
 {
-    Trace.Listeners.Add(new ConsoleTraceListener());
+    var tracer = new VerboseListener();
+    Trace.Listeners.Add(tracer);
     Trace.AutoFlush = true;
 }
 try
@@ -85,3 +82,10 @@ async Task ResolveByName(Solution solution, string symbolName)
         Console.WriteLine($"Line: {span.StartLinePosition.Line}");
     }
 }
+public class VerboseListener : ConsoleTraceListener
+{
+     public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? message)
+         => WriteLine($"[{eventType}] " + message);
+     public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? format, params object?[]? args)
+         => WriteLine($"[{eventType}] " + string.Format(format!, args!));
+ }
